@@ -88,9 +88,10 @@
             (length (node-calls node))
             (length (node-called-from node)))))
 
+(defvar *call-graph-cache* (make-hash-table))
 (defun call-graph (packages &aux
-                   (packages (ensure-package-list packages))
-                   pkgs)
+                            (packages (ensure-package-list packages))
+                            pkgs)
   (labels ((ensure-pkg (sym &aux (pkg (package-name (symbol-package sym))))
              (or
               (find pkg pkgs :test #'string= :key #'cluster-label)
@@ -100,30 +101,35 @@
              (or (find label (cluster-nodes cluster)
                        :test #'string= :key #'node-label)
                  (first (push
-                  (make-node :label label :cluster cluster)
-                  (cluster-nodes cluster)))))
+                         (make-node :label label :cluster cluster)
+                         (cluster-nodes cluster)))))
            (edge (sym caller &aux
-                      (sym (ensure-sym sym))
-                      (caller (ensure-sym caller)))
+                             (sym (ensure-sym sym))
+                             (caller (ensure-sym caller)))
              (pushnew sym (node-calls caller))
              (pushnew caller (node-called-from sym)))
-           (process-sym (symbol accessibility pkg)
+           (process-sym (symbol accessibility pkg)             
              (declare (ignore accessibility pkg))
              (let ((callers (remove-duplicates
-                         (mapcar #'(lambda (caller)
-                                     ;; something like
-                                     ;; (DEFMETHOD fn (args))
-                                     (if (listp caller)
-                                         (let ((fn (second caller)))
-                                           ;; something like (setf foo)
-                                           (if (listp fn) (second fn)
-                                               fn))
-                                         caller))
-                                 (callers symbol)))))
+                             (mapcar #'(lambda (caller)
+                                         ;; something like
+                                         ;; (DEFMETHOD fn (args))
+                                         (if (listp caller)
+                                             (let ((fn (second caller)))
+                                               ;; something like (setf foo)
+                                               (if (listp fn) (second fn)
+                                                   fn))
+                                             caller))
+                                     (callers symbol)))))
                (dolist (c callers)
                  (edge symbol c)))))
+    
     (map-symbols #'process-sym packages))
+  
   pkgs)
+
+(defun graphviz-escape (string)
+  (adwutils:replace-all string ">" "&gt;"))
 
 (defun ->dot (clusters &optional (stream T)
               &aux (*print-pretty* nil))
@@ -138,17 +144,40 @@
       (dolist (node (cluster-nodes cluster))
         (format stream "~a [shape=\"record\",label=\"" (node-graphviz-name node))
         (let ((in-count (length (node-called-from node)))
-              (out-count (length (node-calls node))))
-        (cond
-          ((zerop in-count) (format stream "{~a|<out>~a out}" (node-label node) out-count))
-          ((zerop out-count) (format stream "~[~;<in>~a~:;{<in>~:*~a in|~a}~]" in-count (node-label node)))
-          ((= 1 in-count) (format stream "{<in>~a|<out>~a out}" (node-label node) out-count))
-          (T (format stream "{<in>~a in|~a|<out>~a out}" in-count (node-label node) out-count))
+              (out-count (length (node-calls node)))
+              (label (graphviz-escape (node-label node))))
+          
+          (cond
+            ((or
+              (and (zerop in-count) (zerop out-count))
+              (and (= 1 in-count) (= 1 out-count)))
+             (format stream "<in>~a" label))
+            ((and (zerop in-count) (= 1 out-count)) (format stream "<out>~a" label))
+            ((zerop in-count) (format stream "{~a|<out>~a out}" label out-count))
+            
+            ((and (= 1 in-count) (zerop out-count)) (format stream "<in>~a" label))
+            ((= 1 in-count) (format stream "{<in>~a|<out>~a out}" label out-count))
+
+            ((and (plusp in-count) (zerop out-count))
+             (format stream "{<in>~a in|~a}" in-count label))
+            ((and (plusp in-count) (= 1 out-count))
+             (format stream "{<in>~a in|<out>~a}" in-count label))
+            
+            (T (format stream "{<in>~a in|~a|<out>~a out}" in-count label out-count))
+            )
+
+          (format stream "\"]~%")
+          (dolist (n (node-calls node))
+            (format edges 
+                    (if (and (= 1 in-count) (= 1 out-count))
+                        "~a -> ~a:in~%"
+                        "~A:out -> ~A:in~%"
+                        )
+                        (node-graphviz-name node)
+                        (node-graphviz-name n))
+            )
+
           ))
-        (format stream "\"]~%")
-        (dolist (n (node-calls node))
-          (format edges "~A:out -> ~A:in~%" (node-graphviz-name node)
-                  (node-graphviz-name n))))
       (format stream "}~%"))
     (format stream (get-output-stream-string edges)))
   (format stream "~&}~%"))
@@ -163,7 +192,8 @@
   (->dot (call-graph packages) stream))
 
 
-(defun function-call-graph (packages symbols &optional (max-depth 1024)
+(defun function-call-graph (packages symbols
+                            &optional (max-depth 1024) call-graph
                             &aux nodes-to-keep
                             seen)
   "spiders down from symbols"
@@ -175,7 +205,7 @@
                  (dolist (n (node-calls node))
                    (add-nodes n (1+ depth)))))))
     (iter
-      (with call-graph = (call-graph packages))
+      (with call-graph = (or call-graph (call-graph packages)))
       (for sym in symbols)
       (for cluster = (find (package-name (symbol-package sym))
                            call-graph
@@ -183,8 +213,7 @@
       (for node = (find (symbol-name sym)
                         (cluster-nodes cluster)
                         :test #'string= :key #'node-label))
-      (add-nodes node)
-      ))
+      (add-nodes node)))
   (iter (for n in nodes-to-keep)
     (setf (node-calls n)
           (intersection (node-calls n)
@@ -195,7 +224,41 @@
         (make-cluster :label (cluster-label cluster)
                       :nodes (remove-if-not #'(lambda (node)
                                                 (eq cluster (node-cluster node)))
-                                        nodes-to-keep)))))
+                                            nodes-to-keep)))))
+
+(defun function-caller-graph (packages symbols
+                            &optional (max-depth 1024) call-graph
+                            &aux nodes-to-keep
+                            seen)
+  "spiders down from symbols"
+  (labels ((add-nodes (node &optional (depth 0))
+             (when (and node (< depth max-depth))
+               (pushnew node nodes-to-keep)
+               (unless (member node seen)
+                 (push node seen)
+                 (dolist (n (node-called-from node))
+                   (add-nodes n (1+ depth)))))))
+    (iter
+      (with call-graph = (or call-graph (call-graph packages)))
+      (for sym in symbols)
+      (for cluster = (find (package-name (symbol-package sym))
+                           call-graph
+                           :test #'string= :key #'cluster-label))
+      (for node = (find (symbol-name sym)
+                        (cluster-nodes cluster)
+                        :test #'string= :key #'node-label))
+      (add-nodes node)))
+  (iter (for n in nodes-to-keep)
+    (setf (node-calls n)
+          (intersection (node-calls n)
+                        nodes-to-keep)))
+  (iter
+    (for cluster in (remove-duplicates (mapcar #'node-cluster nodes-to-keep)))
+    (collect
+        (make-cluster :label (cluster-label cluster)
+                      :nodes (remove-if-not #'(lambda (node)
+                                                (eq cluster (node-cluster node)))
+                                            nodes-to-keep)))))
 
 
 (defun asdf-systems (&aux (sys (list)))
