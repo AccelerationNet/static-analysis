@@ -248,17 +248,24 @@
                         (cluster-nodes cluster)
                         :test #'string= :key #'node-label))
       (add-nodes node)))
-  (iter (for n in nodes-to-keep)
-    (setf (node-calls n)
-          (intersection (node-calls n)
-                        nodes-to-keep)))
   (iter
     (for cluster in (remove-duplicates (mapcar #'node-cluster nodes-to-keep)))
     (collect
         (make-cluster :label (cluster-label cluster)
-                      :nodes (remove-if-not #'(lambda (node)
-                                                (eq cluster (node-cluster node)))
-                                            nodes-to-keep)))))
+                      :nodes (iter (for node in nodes-to-keep)
+                               (when (eq cluster (node-cluster node))
+                                 ;; make a copy
+                                 (let ((copy-node (copy-node node )))
+                                   ;; modify it's call lists to stay within this graph
+                                   (setf (node-calls copy-node)
+                                         (intersection (node-calls node)
+                                                       nodes-to-keep)
+
+                                         (node-called-from copy-node)
+                                         (intersection (node-called-from node)
+                                                       nodes-to-keep)
+                                         )
+                                   (collect copy-node))))))))
 
 
 (defun asdf-systems (&aux (sys (list)))
